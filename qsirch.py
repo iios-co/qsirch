@@ -113,19 +113,24 @@ class QsirchClient:
         Search the Qsirch index.
 
         Uses GET for general search, POST with {"tools": category} for
-        category-scoped search (Email, PDF, Documents, Images, etc.).
+        category-scoped search.
 
-        IMPORTANT: Server-side ext/type/category GET params are broken.
-        Extension/path/date filtering must be done client-side.
+        IMPORTANT:
+        - Server-side GET filter params (ext, type, category) are silently ignored.
+          All extension/path/date filtering must be done client-side.
+        - POST tools=Email is the only strictly reliable category filter.
+          Other tools values return mixed file types.
+        - Sort param is 'sort_by' (not 'sort'). Direction is 'sort_dir' (not 'order').
+        - Default sort direction is ascending when sort_dir is omitted.
 
         Args:
             query: Search terms. Use '.' or ' ' for wildcard. '*' is unreliable.
             limit: Max results per page (practical max ~500).
             offset: Pagination offset.
             sort_by: relevance, modified, created, size, name. NOT 'title' (broken).
-            sort_dir: 'desc' or 'asc'.
-            category: POST tools filter — Email, PDF, Documents, Images, Videos,
-                      Music, Excel, Word.
+            sort_dir: 'desc' or 'asc'. Default server behavior is ascending.
+            category: POST tools filter — only 'Email' is strictly reliable.
+                      Other values (PDF, Documents, etc.) return mixed results.
         """
         params = {"q": query, "limit": limit, "offset": offset}
 
@@ -313,8 +318,8 @@ def filter_items(
     """
     Client-side filtering for search results.
 
-    Required because server-side ext/type/category GET parameters are broken
-    in Qsirch 7 and silently return 0 results.
+    Required because server-side GET filter parameters (ext, type, category)
+    are silently ignored by Qsirch 7 — they have no effect on results.
     """
     dt_from = datetime.strptime(date_from, "%Y-%m-%d") if date_from else None
     dt_to = datetime.strptime(date_to, "%Y-%m-%d") if date_to else None

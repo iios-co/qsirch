@@ -62,11 +62,11 @@ python qsirch.py search -q "statement" --ext pdf --path "QmailAgent" --from-date
 python qsirch.py search -q "receipt" --sort modified --limit 20 --json
 ```
 
-**Available categories** (POST `tools` filter): `Email`, `PDF`, `Documents`, `Images`, `Videos`, `Music`, `Excel`, `Word`
+**Available categories** (POST `tools` filter): `Email` is the only strictly reliable filter. Other values (`PDF`, `Documents`, `Images`, `Videos`, `Music`, `Excel`, `Word`) return mixed results — use `--ext` for precise filtering.
 
 **Sort fields**: `relevance`, `modified`, `created`, `size`, `name`
 
-> **Note:** Do not use `title` as a sort field — it is broken server-side and returns 0 results.
+> **Note:** Do not use `title` as a sort field — it is broken server-side and returns 0 results. Default sort direction is ascending; use `--order desc` for newest-first.
 
 ### Preview
 
@@ -112,19 +112,23 @@ python qsirch.py similar --id "934a6bd662abdb5dfc3654e4d8ac8c92145d00ea" --limit
 
 ## API Quirks & Caveats
 
-This client works around several undocumented Qsirch API issues:
+This client works around several undocumented Qsirch 7 API behaviors, verified via live testing:
 
-1. **Server-side extension filtering is broken** — passing `ext`, `extension`, `type`, `category`, or `file_type` as GET query parameters silently returns 0 results. This client filters client-side.
+1. **GET filter parameters are silently ignored** — passing `ext`, `extension`, `type`, `category`, or `file_type` as GET query parameters does not cause errors but has **no effect on results** (same total, same items as without them). All extension/type filtering must be done client-side.
 
-2. **Category filtering requires POST** — `POST /qsirch/latest/api/search?q=<query>` with body `{"tools": "Email"}`. The `q` parameter must remain in the URL query string.
+2. **POST `tools` filtering only works reliably for `Email`** — `POST /qsirch/latest/api/search?q=<query>` with body `{"tools": "Email"}` correctly restricts results to `.eml` files. However, other tools values (`PDF`, `Documents`, `Excel`, `Word`, `Images`) return **mixed file types** and are not reliable as strict filters. The `q` parameter must be in the URL query string, not the JSON body.
 
-3. **`sort_by=title` is broken** — returns `total: 0`. Use `name` instead.
+3. **Sort parameter is `sort_by`, not `sort`** — only `sort_by` is recognized. The legacy name `sort` is silently ignored. Valid values: `modified`, `created`, `size`, `name`, `relevance`.
 
-4. **Path resolution** — `item["path"]` is only the parent directory. The actual full file path is in `item["preview"]["info"]` where `key == "path"`.
+4. **`sort_by=title` is broken** — returns `total: 0`. Use `name` instead.
 
-5. **All file actions route through `/qusion-item`** — no separate download/preview endpoints. Action URLs are returned dynamically in each item's `actions` object.
+5. **Sort direction parameter is `sort_dir`, not `order`** — only `sort_dir` (`asc`/`desc`) works. The default direction (when `sort_dir` is omitted) is **ascending**.
 
-6. **Session expiry** — returns HTTP 401 with `{"error": {"code": 101, ...}}`. This client automatically re-authenticates once and retries.
+6. **Path resolution** — `item["path"]` is only the parent directory. The actual full file path is in `item["preview"]["info"]` where `key == "path"`.
+
+7. **All file actions route through `/qusion-item`** — no separate download/preview endpoints. Action URLs are returned dynamically in each item's `actions` object.
+
+8. **Session expiry** — returns HTTP 401 with `{"error": {"code": 101, ...}}`. This client automatically re-authenticates once and retries.
 
 ## Search Response Structure
 

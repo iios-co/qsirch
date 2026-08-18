@@ -68,8 +68,9 @@ python qsirch.py similar --id <item_id> [--limit 10] [--category Email] [--json]
 
 ## Key API Notes
 
-- Extension/type GET params are **broken server-side** — filtering is done client-side.
-- Category filtering uses POST with `{"tools": "Email"}`.
-- `sort_by=title` is broken — use `name`.
+- Extension/type GET params are **silently ignored** — filtering is done client-side.
+- POST `tools=Email` is the only strictly reliable category filter. Other tools values (PDF, Documents, etc.) return mixed results — always combine with `--ext` for precise filtering.
+- Sort param is `sort_by` (not `sort`). Direction is `sort_dir` (not `order`). Default direction is ascending.
+- `sort_by=title` is broken (returns 0 results) — use `name`.
 - `item["path"]` is parent dir only — full path is in `item["preview"]["info"][key=="path"]`.
 - Session auto-recovers on HTTP 401 / error code 101.
