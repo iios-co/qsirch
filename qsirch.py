@@ -3,8 +3,22 @@
 Qsirch CLI — QNAP Qsirch 7 REST API Client
 
 A command-line tool for searching emails, documents, and files indexed by
-QNAP Qsirch 7. Supports full-text search, category filtering, email HTML
-preview extraction, file download, and semantic similar-item discovery.
+QNAP Qsirch 7. Supports full-text search with advanced query syntax (exact
+phrases, boolean OR/AND/NOT, exclusion), server-side category filtering,
+email HTML preview extraction, file download, and semantic similar-item discovery.
+
+Query syntax (in q= parameter):
+    "exact phrase"     — Match exact phrase
+    term1 OR term2     — Boolean OR
+    term1 AND term2    — Boolean AND (stricter than default)
+    term1 NOT term2    — Exclude term2
+    term1 -term2       — Exclude term2 (short form)
+    (term1, OR term2)  — Grouping with parentheses
+
+Search modes (advanced_mode):
+    0 — Standard full-text search (default)
+    1 — Image OCR search (searches text within images only)
+    2 — Combined text + image search
 
 Authentication: QTS CGI login (POST /cgi-bin/authLogin.cgi) with Base64 password.
 Session: NAS_SID cookie with automatic re-authentication on expiry.
@@ -108,6 +122,7 @@ class QsirchClient:
         sort_by: Optional[str] = None,
         sort_dir: str = "desc",
         category: Optional[str] = None,
+        advanced_mode: int = 0,
     ) -> Dict[str, Any]:
         """
         Search the Qsirch index.
@@ -115,29 +130,42 @@ class QsirchClient:
         Uses GET for general search, POST with {"tools": category} for
         category-scoped search.
 
+        Query syntax (applied directly in the q= parameter):
+            "exact phrase"    — Exact phrase match
+            term1 OR term2    — Boolean OR (more results)
+            term1 AND term2   — Boolean AND (stricter)
+            term1 NOT term2   — Exclude term2
+            term1 -term2      — Exclude term2 (short form)
+            (term1, OR term2) — Grouping with parentheses
+
         IMPORTANT:
-        - Server-side GET filter params (ext, type, category) are silently ignored.
-          All extension/path/date filtering must be done client-side.
+        - GET filter params (ext, type, category, q.category, q.modified, q.path,
+          q.name, q.string) are all silently ignored by the API. The q.* params
+          seen in the web UI URL are client-side UI state, not API filters.
         - POST tools=Email is the only strictly reliable category filter.
           Other tools values return mixed file types.
         - Sort param is 'sort_by' (not 'sort'). Direction is 'sort_dir' (not 'order').
         - Default sort direction is ascending when sort_dir is omitted.
+        - For sort_by=relevance, sort_dir has no effect (always best-match-first).
+        - Use '.' or ' ' for wildcard (match all). '*' returns 0 results.
 
         Args:
-            query: Search terms. Use '.' or ' ' for wildcard. '*' is unreliable.
+            query: Search terms with optional query syntax.
             limit: Max results per page (practical max ~500).
             offset: Pagination offset.
             sort_by: relevance, modified, created, size, name. NOT 'title' (broken).
             sort_dir: 'desc' or 'asc'. Default server behavior is ascending.
             category: POST tools filter — only 'Email' is strictly reliable.
                       Other values (PDF, Documents, etc.) return mixed results.
+            advanced_mode: 0=text search (default), 1=image OCR, 2=combined.
         """
         params = {
             "q": query,
             "limit": limit,
             "offset": offset,
             "highlight": "content",
-            "highlight_limit": "200",
+            "highlight_limit": "500",
+            "advanced_mode": str(advanced_mode),
         }
 
         if sort_by and sort_by != "relevance":
@@ -378,6 +406,7 @@ def cmd_search(args, client: QsirchClient):
         sort_by=args.sort,
         sort_dir=args.order,
         category=args.category,
+        advanced_mode=args.mode,
     )
 
     total = data.get("total", 0)
@@ -554,14 +583,17 @@ def main():
 
     # ─── search ───────────────────────────────────────────────────────────────
     sp_search = subparsers.add_parser("search", help="Full-text search")
-    sp_search.add_argument("--query", "-q", required=True, help="Search query (use '.' for wildcard)")
+    sp_search.add_argument(
+        "--query", "-q", required=True,
+        help="Search query with optional syntax: \"exact phrase\", OR, AND, NOT, -exclude, (group)",
+    )
     sp_search.add_argument(
         "--ext", help="Client-side extension filter (eml, pdf, doc, xlsx, csv)"
     )
     sp_search.add_argument(
         "--category",
         choices=["Email", "PDF", "Documents", "Images", "Videos", "Music", "Excel", "Word"],
-        help="Server-side category filter (POST search)",
+        help="Server-side category filter via POST (only 'Email' is strictly reliable)",
     )
     sp_search.add_argument("--limit", type=int, default=50, help="Max results (default: 50)")
     sp_search.add_argument("--offset", type=int, default=0, help="Pagination offset")
@@ -571,6 +603,10 @@ def main():
         help="Sort field (NOT 'title' — broken server-side)",
     )
     sp_search.add_argument("--order", choices=["asc", "desc"], default="desc", help="Sort direction")
+    sp_search.add_argument(
+        "--mode", type=int, choices=[0, 1, 2], default=0,
+        help="Search mode: 0=text (default), 1=image OCR, 2=combined",
+    )
     sp_search.add_argument("--path", help="Client-side path substring filter")
     sp_search.add_argument("--from-date", help="Client-side date filter from (YYYY-MM-DD)")
     sp_search.add_argument("--to-date", help="Client-side date filter to (YYYY-MM-DD)")

@@ -34,13 +34,14 @@ python qsirch.py search -q "<KEYWORDS>" [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-q` / `--query` | *(required)* | Search query (use `.` for wildcard match-all) |
-| `--category` | | Server-side filter: `Email`, `PDF`, `Documents`, `Images`, `Videos`, `Music`, `Excel`, `Word` |
+| `-q` / `--query` | *(required)* | Search query with syntax: `"exact phrase"`, `OR`, `AND`, `NOT`, `-exclude`, `(group)`. Use `.` for wildcard. |
+| `--category` | | Server-side filter via POST: `Email` (only strictly reliable). Others return mixed results. |
 | `--ext` | | Client-side extension filter: `eml`, `pdf`, `doc`, `xlsx`, `csv` |
 | `--limit` | `50` | Max results |
 | `--offset` | `0` | Pagination offset |
 | `--sort` | | `relevance`, `modified`, `created`, `size`, `name` |
-| `--order` | `desc` | `asc` / `desc` |
+| `--order` | `desc` | `asc` / `desc` (default is ascending server-side; ignored for relevance) |
+| `--mode` | `0` | `0`=text, `1`=image OCR, `2`=combined |
 | `--path` | | Client-side path substring filter |
 | `--from-date` | | Date from (`YYYY-MM-DD`) |
 | `--to-date` | | Date to (`YYYY-MM-DD`) |
@@ -68,9 +69,15 @@ python qsirch.py similar --id <item_id> [--limit 10] [--category Email] [--json]
 
 ## Key API Notes
 
+- **Advanced query syntax works in `q=`**: `"exact phrase"`, `OR`, `AND`, `NOT`, `-exclude`, `(grouping)` are all processed server-side.
+- `q.*` params (`q.category`, `q.modified`, `q.path`, `q.name`, `q.string`) in the web UI URL are **client-side UI state** — the API ignores them.
 - Extension/type GET params are **silently ignored** — filtering is done client-side.
-- POST `tools=Email` is the only strictly reliable category filter. Other tools values (PDF, Documents, etc.) return mixed results — always combine with `--ext` for precise filtering.
-- Sort param is `sort_by` (not `sort`). Direction is `sort_dir` (not `order`). Default direction is ascending.
+- POST `tools=Email` is the only strictly reliable category filter. Other values return mixed types — combine with `--ext`.
+- Sort param is `sort_by` (not `sort`). Direction is `sort_dir` (not `order`). Default direction is ascending. Ignored for `relevance`.
 - `sort_by=title` is broken (returns 0 results) — use `name`.
+- Wildcard is `.` or space — `*` returns 0 results.
+- `advanced_mode`: `0`=text, `1`=image OCR, `2`=combined.
+- `highlight=content` wraps matches in `<qusion>` tags; `highlight_limit` controls snippet length.
 - `item["path"]` is parent dir only — full path is in `item["preview"]["info"][key=="path"]`.
 - Session auto-recovers on HTTP 401 / error code 101.
+- API aliases: `/v1/`, `/v2/`, `/stable/`, `/latest/` all resolve identically.
