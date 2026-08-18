@@ -163,8 +163,6 @@ class QsirchClient:
             "q": query,
             "limit": limit,
             "offset": offset,
-            "highlight": "content",
-            "highlight_limit": "500",
             "advanced_mode": str(advanced_mode),
         }
 
