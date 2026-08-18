@@ -132,7 +132,13 @@ class QsirchClient:
             category: POST tools filter — only 'Email' is strictly reliable.
                       Other values (PDF, Documents, etc.) return mixed results.
         """
-        params = {"q": query, "limit": limit, "offset": offset}
+        params = {
+            "q": query,
+            "limit": limit,
+            "offset": offset,
+            "highlight": "content",
+            "highlight_limit": "200",
+        }
 
         if sort_by and sort_by != "relevance":
             params["sort_by"] = sort_by

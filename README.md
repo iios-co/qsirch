@@ -122,13 +122,17 @@ This client works around several undocumented Qsirch 7 API behaviors, verified v
 
 4. **`sort_by=title` is broken** — returns `total: 0`. Use `name` instead.
 
-5. **Sort direction parameter is `sort_dir`, not `order`** — only `sort_dir` (`asc`/`desc`) works. The default direction (when `sort_dir` is omitted) is **ascending**.
+5. **Sort direction parameter is `sort_dir`, not `order`** — only `sort_dir` (`asc`/`desc`) works. The default direction (when `sort_dir` is omitted) is **ascending**. For `sort_by=relevance`, `sort_dir` is ignored (always returns best match first).
 
-6. **Path resolution** — `item["path"]` is only the parent directory. The actual full file path is in `item["preview"]["info"]` where `key == "path"`.
+6. **`highlight=content`** — wraps search term matches in `<qusion>...</qusion>` tags within the `content` snippet field. Use `highlight_limit` to control snippet length.
 
-7. **All file actions route through `/qusion-item`** — no separate download/preview endpoints. Action URLs are returned dynamically in each item's `actions` object.
+7. **`advanced_mode=1`** — activates image/OCR search mode. Dramatically reduces results to image files only (jpg, webp, bmp, png). Default `advanced_mode=0` is standard full-text search.
 
-8. **Session expiry** — returns HTTP 401 with `{"error": {"code": 101, ...}}`. This client automatically re-authenticates once and retries.
+8. **Path resolution** — `item["path"]` is only the parent directory. The actual full file path is in `item["preview"]["info"]` where `key == "path"`.
+
+9. **All file actions route through `/qusion-item`** — no separate download/preview endpoints. Action URLs are returned dynamically in each item's `actions` object.
+
+10. **Session expiry** — returns HTTP 401 with `{"error": {"code": 101, ...}}`. This client automatically re-authenticates once and retries.
 
 ## Search Response Structure
 
