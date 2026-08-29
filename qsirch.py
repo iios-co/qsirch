@@ -47,6 +47,9 @@ except ImportError:
     sys.exit(1)
 
 
+MAX_PAGE_SIZE = 500
+
+
 class QsirchClient:
     """Qsirch 7 REST API client with session management and auto re-authentication."""
 
@@ -127,8 +130,7 @@ class QsirchClient:
         """
         Search the Qsirch index.
 
-        Uses GET for general search, POST with {"tools": category} for
-        category-scoped search.
+        Uses Qsirch search expressions for an optional category scope.
 
         Query syntax (applied directly in the q= parameter):
             "exact phrase"    — Exact phrase match
@@ -136,14 +138,14 @@ class QsirchClient:
             term1 AND term2   — Boolean AND (stricter)
             term1 NOT term2   — Exclude term2
             term1 -term2      — Exclude term2 (short form)
-            (term1, OR term2) — Grouping with parentheses
+            (term1 OR term2)  — Grouping with parentheses
 
         IMPORTANT:
         - GET filter params (ext, type, category, q.category, q.modified, q.path,
           q.name, q.string) are all silently ignored by the API. The q.* params
           seen in the web UI URL are client-side UI state, not API filters.
-        - POST tools=Email is the only strictly reliable category filter.
-          Other tools values return mixed file types.
+        - The POST ``tools`` member is not a structured filter. Category
+          filters are search expressions such as ``category:Email``.
         - Sort param is 'sort_by' (not 'sort'). Direction is 'sort_dir' (not 'order').
         - Default sort direction is ascending when sort_dir is omitted.
         - For sort_by=relevance, sort_dir has no effect (always best-match-first).
@@ -151,19 +153,28 @@ class QsirchClient:
 
         Args:
             query: Search terms with optional query syntax.
-            limit: Max results per page (practical max ~500).
+            limit: Max results per page (clamped to 500).
             offset: Pagination offset.
             sort_by: relevance, modified, created, size, name. NOT 'title' (broken).
             sort_dir: 'desc' or 'asc'. Default server behavior is ascending.
-            category: POST tools filter — only 'Email' is strictly reliable.
-                      Other values (PDF, Documents, etc.) return mixed results.
+            category: Optional Qsirch category expression suffix, such as
+                      ``Email`` or ``Documents``. Use ``--ext`` for an exact
+                      extension filter.
             advanced_mode: 0=text search (default), 1=image OCR, 2=combined.
         """
+        page_size = max(1, min(int(limit), MAX_PAGE_SIZE))
+        page_offset = max(0, int(offset))
+        server_query = query
+        if category and category.lower() != "all":
+            server_query = f"{query} category:{category.strip()}"
+
         params = {
-            "q": query,
-            "limit": limit,
-            "offset": offset,
+            "q": server_query,
+            "limit": page_size,
+            "offset": page_offset,
             "advanced_mode": str(advanced_mode),
+            # API consumers should not create entries in a user's NAS history.
+            "store_history": 0,
         }
 
         if sort_by and sort_by != "relevance":
@@ -171,15 +182,7 @@ class QsirchClient:
             params["sort_dir"] = sort_dir
 
         try:
-            if category and category.lower() != "all":
-                resp = self._request(
-                    "POST",
-                    "/qsirch/latest/api/search",
-                    params=params,
-                    json={"tools": category, "limit": limit},
-                )
-            else:
-                resp = self._request("GET", "/qsirch/latest/api/search", params=params)
+            resp = self._request("GET", "/qsirch/latest/api/search", params=params)
 
             resp.raise_for_status()
             return resp.json()
@@ -590,8 +593,8 @@ def main():
     )
     sp_search.add_argument(
         "--category",
-        choices=["Email", "PDF", "Documents", "Images", "Videos", "Music", "Excel", "Word"],
-        help="Server-side category filter via POST (only 'Email' is strictly reliable)",
+        choices=["Email", "Documents", "Images", "Videos", "Music"],
+        help="Server-side category expression (use --ext for exact file types)",
     )
     sp_search.add_argument("--limit", type=int, default=50, help="Max results (default: 50)")
     sp_search.add_argument("--offset", type=int, default=0, help="Pagination offset")

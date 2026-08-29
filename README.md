@@ -7,7 +7,7 @@ Built from comprehensive reverse-engineering of the undocumented Qsirch 7 API.
 ## Features
 
 - **Full-text search** with advanced query syntax (exact phrases, boolean OR/AND/NOT, exclusion, grouping)
-- **Server-side category filtering** via POST (Email is strictly reliable)
+- **Server-side category narrowing** using verified Qsirch expressions
 - **Client-side filtering** by extension, path substring, and date range
 - **Email preview** — extract full rendered HTML email bodies without downloading raw `.eml` files
 - **File download** — save any indexed file to local disk
@@ -32,7 +32,7 @@ Authentication is configured via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `QSIRCH_HOST` | QNAP NAS IP or hostname | `10.0.0.3` |
-| `QSIRCH_PORT` | HTTP port | `8080` |
+| `QSIRCH_PORT` | HTTP port (`8080`) or HTTPS port (`443` is common) | `8080` |
 | `QSIRCH_USER` | NAS username | *(required)* |
 | `QSIRCH_PASS` | NAS password | *(required)* |
 | `QSIRCH_SSL` | Set to `1` for HTTPS | `0` |
@@ -64,9 +64,9 @@ python qsirch.py search -q "invoice NOT ebay"
 
 # Exclusion (short form) and grouping
 python qsirch.py search -q "invoice -ebay"
-python qsirch.py search -q "(invoice, OR receipt) -ebay"
+python qsirch.py search -q "(invoice OR receipt) -ebay"
 
-# Search emails only (server-side category filter via POST)
+# Search emails only (server-side category expression)
 python qsirch.py search -q "invoice" --category Email
 
 # Filter by extension, path, and date range (client-side)
@@ -93,12 +93,15 @@ The `q=` parameter supports advanced query syntax:
 | `AND` | `invoice AND amazon` | Match both terms (stricter than default) |
 | `NOT` | `invoice NOT ebay` | Exclude results containing term |
 | `-term` | `invoice -ebay` | Exclude (short form) |
-| `(group)` | `(invoice, OR receipt)` | Group terms |
+| `(group)` | `(invoice OR receipt)` | Group terms |
 | `.` | `.` | Wildcard — match all indexed files |
 
 > **Note:** `*` as wildcard returns 0 results. Use `.` or a space instead.
 
-**Available categories** (POST `tools` filter): `Email` is the only strictly reliable filter. Other values (`PDF`, `Documents`, `Images`, `Videos`, `Music`, `Excel`, `Word`) return mixed results — use `--ext` for precise filtering.
+**Categories** are Qsirch search expressions, for example `category:Email`,
+`category:Documents`, `category:Images`, `category:Videos`, and
+`category:Music`. The CLI constructs these when `--category` is supplied. Use
+`--ext` for precise file-type filtering inside a broad category.
 
 **Sort fields**: `relevance`, `modified`, `created`, `size`, `name`
 
@@ -158,7 +161,11 @@ This client works around several undocumented Qsirch 7 API behaviors, verified v
 
 3. **Advanced query syntax works in `q=`** — the `q` parameter supports exact phrases (`"..."`), boolean operators (`OR`, `AND`, `NOT`), exclusion (`-term`), and grouping (`(...)`). These are processed server-side and affect result counts.
 
-4. **POST `tools` filtering only works reliably for `Email`** — `POST /qsirch/latest/api/search?q=<query>` with body `{"tools": "Email"}` correctly restricts results to `.eml` files. Other tools values (`PDF`, `Documents`, `Excel`, `Word`, `Images`) return **mixed file types**. The `q` parameter must be in the URL query string, not the JSON body.
+4. **POST `tools` is not a structured filter** — Qsirch appends the string in
+   `tools` to the query and parses the combination as one search expression.
+   Use `category:Email`, `category:Documents`, `category:Images`,
+   `category:Videos`, or `category:Music` in `q` instead. Generic GET filter
+   parameters remain ignored.
 
 5. **Sort parameter is `sort_by`, not `sort`** — the legacy name `sort` is silently ignored. Valid values: `modified`, `created`, `size`, `name`, `relevance`.
 
@@ -179,6 +186,12 @@ This client works around several undocumented Qsirch 7 API behaviors, verified v
 13. **Session expiry** — returns HTTP 401 with `{"error": {"code": 101, ...}}`. This client automatically re-authenticates once and retries.
 
 14. **API path aliases** — `/qsirch/v1/api/`, `/qsirch/v2/api/`, `/qsirch/stable/api/`, and `/qsirch/latest/api/` all resolve to the same endpoint.
+
+15. **Avoid NAS history pollution** — searches send `store_history=0` so CLI
+    use does not create entries in the Qsirch web-client history.
+
+16. **Clamp pages to 500 items** — larger requests can stall instead of
+    returning a validation error.
 
 ## Search Response Structure
 
