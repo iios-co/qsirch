@@ -5,7 +5,8 @@ Qsirch CLI — QNAP Qsirch 7 REST API Client
 A command-line tool for searching emails, documents, and files indexed by
 QNAP Qsirch 7. Supports full-text search with advanced query syntax (exact
 phrases, boolean OR/AND/NOT, exclusion), server-side category filtering,
-email HTML preview extraction, file download, and semantic similar-item discovery.
+autocomplete suggestions, email HTML preview extraction, OCR text-block
+detection, file download, and semantic similar-item discovery.
 
 Query syntax (in q= parameter):
     "exact phrase"     — Match exact phrase
@@ -14,14 +15,12 @@ Query syntax (in q= parameter):
     term1 NOT term2    — Exclude term2
     term1 -term2       — Exclude term2 (short form)
     (term1, OR term2)  — Grouping with parentheses
+    .                  — Wildcard, match all indexed files ('*' returns 0)
 
 Search modes (advanced_mode):
     0 — Standard full-text search (default)
     1 — Image OCR search (searches text within images only)
     2 — Combined text + image search
-
-Authentication: QTS CGI login (POST /cgi-bin/authLogin.cgi) with Base64 password.
-Session: NAS_SID cookie with automatic re-authentication on expiry.
 
 Environment variables:
     QSIRCH_HOST  — NAS IP/hostname (default: 10.0.0.3)
@@ -29,16 +28,20 @@ Environment variables:
     QSIRCH_USER  — Username (required if not passed via --user)
     QSIRCH_PASS  — Password (required if not passed via --pass)
     QSIRCH_SSL   — Set to "1" for HTTPS (default: 0)
+
+Exit codes: 0 success, 2 authentication failure, 3 API/transport failure.
 """
 
 import sys
 import os
+import re
 import base64
 import xml.etree.ElementTree as ET
 import argparse
 import json
-from datetime import datetime
-from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+from urllib.parse import quote
 
 try:
     import requests
@@ -47,13 +50,42 @@ except ImportError:
     sys.exit(1)
 
 
+# ─── Errors ───────────────────────────────────────────────────────────────────
+
+
+class QsirchError(Exception):
+    """Base error. Carries a process exit code for machine-readable handling."""
+
+    exit_code = 3
+
+
+class AuthError(QsirchError):
+    exit_code = 2
+
+
+class APIError(QsirchError):
+    pass
+
+
+# The API returns an empty body (no 'total' key) instead of an error when
+# 'limit' exceeds the server ceiling. Verified live: 1000 works, 1200+ yields
+# {"items": []} with no total.
+MAX_RESULT_LIMIT = 1000
+
+# 'highlight=content' wraps matches in <qusion> tags but only works reliably
+# at the default snippet length; highlight_limit above ~500 returns an EMPTY
+# content field (server bug, verified live). Snippets stay 500 chars.
+MAX_HIGHLIGHT_LIMIT = 500
+
+
 class QsirchClient:
     """Qsirch 7 REST API client with session management and auto re-authentication."""
 
-    def __init__(self, host: str, port: int = 8080, use_ssl: bool = False):
+    def __init__(self, host: str, port: int = 8080, use_ssl: bool = False, timeout: int = 15):
         protocol = "https" if use_ssl else "http"
         self.base_url = f"{protocol}://{host}:{port}"
         self.session = requests.Session()
+        self.timeout = timeout
         self.sid: Optional[str] = None
         self._username: Optional[str] = None
         self._password: Optional[str] = None
@@ -62,7 +94,9 @@ class QsirchClient:
         """Authenticate via QTS CGI login. Stores credentials for re-auth."""
         self._username = username
         self._password = password
-        return self._do_login()
+        if not self._do_login():
+            raise AuthError(f"authentication failed for '{username}'")
+        return True
 
     def _do_login(self) -> bool:
         """Perform the actual login request."""
@@ -71,7 +105,7 @@ class QsirchClient:
         payload = {"user": self._username, "pwd": b64_password}
 
         try:
-            resp = self.session.post(login_url, data=payload, timeout=10)
+            resp = self.session.post(login_url, data=payload, timeout=self.timeout)
             resp.raise_for_status()
             root = ET.fromstring(resp.text)
 
@@ -93,24 +127,37 @@ class QsirchClient:
             return False
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        """Make an authenticated request with auto re-auth on 401."""
+        """Make an authenticated request with auto re-auth on session expiry.
+
+        QTS signals expiry in two shapes: JSON {"error": {"code": 101}} and a
+        bare 401 (sometimes with an HTML login page). Both are handled.
+        """
         url = f"{self.base_url}{path}" if path.startswith("/") else f"{self.base_url}/{path}"
-        timeout = kwargs.pop("timeout", 15)
+        timeout = kwargs.pop("timeout", self.timeout)
 
         resp = self.session.request(method, url, timeout=timeout, **kwargs)
 
-        # Handle expired session: re-auth once and retry
         if resp.status_code == 401:
+            expired = False
             try:
                 body = resp.json()
-                if body.get("error", {}).get("code") == 101:
-                    print("[Info] Session expired, re-authenticating...", file=sys.stderr)
-                    if self._do_login():
-                        resp = self.session.request(method, url, timeout=timeout, **kwargs)
-            except (ValueError, KeyError):
-                pass
+                expired = body.get("error", {}).get("code") == 101
+            except ValueError:
+                expired = True  # non-JSON 401: treat as session expiry too
+            if expired and self._do_login():
+                resp = self.session.request(method, url, timeout=timeout, **kwargs)
 
         return resp
+
+    def _get_json(self, path: str, params: Optional[Dict] = None, what: str = "request") -> Dict[str, Any]:
+        """GET expecting JSON. Raises APIError with the server's detail."""
+        resp = self._request("GET", path, params=params)
+        if resp.status_code != 200:
+            raise APIError(f"{what} failed: HTTP {resp.status_code}: {resp.text[:200]}")
+        try:
+            return resp.json()
+        except ValueError:
+            raise APIError(f"{what} returned non-JSON: {resp.text[:200]}")
 
     # ─── Search ───────────────────────────────────────────────────────────────
 
@@ -123,6 +170,7 @@ class QsirchClient:
         sort_dir: str = "desc",
         category: Optional[str] = None,
         advanced_mode: int = 0,
+        highlight: bool = False,
     ) -> Dict[str, Any]:
         """
         Search the Qsirch index.
@@ -137,56 +185,106 @@ class QsirchClient:
             term1 NOT term2   — Exclude term2
             term1 -term2      — Exclude term2 (short form)
             (term1, OR term2) — Grouping with parentheses
+            .                 — Wildcard, match all ('*' returns 0 results)
 
         IMPORTANT:
         - GET filter params (ext, type, category, q.category, q.modified, q.path,
-          q.name, q.string) are all silently ignored by the API. The q.* params
-          seen in the web UI URL are client-side UI state, not API filters.
+          q.name, q.string) are all silently ignored by the API (re-verified).
+          The q.* params seen in the web UI URL are client-side UI state.
         - POST tools=Email is the only strictly reliable category filter.
           Other tools values return mixed file types.
-        - Sort param is 'sort_by' (not 'sort'). Direction is 'sort_dir' (not 'order').
+        - Sort param is 'sort_by' (not 'sort'). Direction is 'sort_dir'.
         - Default sort direction is ascending when sort_dir is omitted.
-        - For sort_by=relevance, sort_dir has no effect (always best-match-first).
-        - Use '.' or ' ' for wildcard (match all). '*' returns 0 results.
+        - For sort_by=relevance, sort_dir has no effect.
+        - limit is clamped to MAX_RESULT_LIMIT (1000): above it the API returns
+          an empty body without 'total' instead of an error.
 
         Args:
             query: Search terms with optional query syntax.
-            limit: Max results per page (practical max ~500).
+            limit: Max results per page (server ceiling 1000).
             offset: Pagination offset.
             sort_by: relevance, modified, created, size, name. NOT 'title' (broken).
             sort_dir: 'desc' or 'asc'. Default server behavior is ascending.
             category: POST tools filter — only 'Email' is strictly reliable.
-                      Other values (PDF, Documents, etc.) return mixed results.
             advanced_mode: 0=text search (default), 1=image OCR, 2=combined.
+            highlight: wrap matches in <qusion> tags (snippets stay 500 chars;
+                       raising the limit server-side returns empty content).
         """
-        params = {
+        if limit > MAX_RESULT_LIMIT:
+            print(f"[Warn] limit clamped from {limit} to {MAX_RESULT_LIMIT} (server ceiling)", file=sys.stderr)
+            limit = MAX_RESULT_LIMIT
+
+        params: Dict[str, Any] = {
             "q": query,
             "limit": limit,
             "offset": offset,
             "advanced_mode": str(advanced_mode),
         }
+        if highlight:
+            params["highlight"] = "content"
 
         if sort_by and sort_by != "relevance":
             params["sort_by"] = sort_by
             params["sort_dir"] = sort_dir
 
+        if category and category.lower() != "all":
+            resp = self._request(
+                "POST",
+                "/qsirch/latest/api/search",
+                params=params,
+                json={"tools": category, "limit": limit},
+            )
+        else:
+            resp = self._request("GET", "/qsirch/latest/api/search", params=params)
+
+        if resp.status_code != 200:
+            raise APIError(f"search failed: HTTP {resp.status_code}: {resp.text[:200]}")
         try:
-            if category and category.lower() != "all":
-                resp = self._request(
-                    "POST",
-                    "/qsirch/latest/api/search",
-                    params=params,
-                    json={"tools": category, "limit": limit},
-                )
-            else:
-                resp = self._request("GET", "/qsirch/latest/api/search", params=params)
+            data = resp.json()
+        except ValueError:
+            raise APIError(f"search returned non-JSON: {resp.text[:200]}")
 
-            resp.raise_for_status()
-            return resp.json()
+        if "total" not in data:
+            # The API's silent-failure shape (e.g. over-limit requests).
+            raise APIError("search returned no result set (empty body); query or parameters rejected")
+        return data
 
-        except Exception as e:
-            print(f"[Error] Search failed: {e}", file=sys.stderr)
-            return {"total": 0, "items": []}
+    # ─── Async search ─────────────────────────────────────────────────────────
+
+    def async_search(self, query: str, limit: int = 50, category: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Two-phase search. Phase 1 returns the total match count and a result
+        URL immediately (fast even on a huge index); phase 2 fetches the items
+        from that URL. The result window is fixed at submission: limit/offset
+        on the result URL are ignored (verified live), so request the window
+        you want up front.
+        """
+        params: Dict[str, Any] = {"q": query, "limit": min(limit, MAX_RESULT_LIMIT)}
+        if category:
+            params["tools"] = category
+        data = self._get_json("/qsirch/latest/api/async-search", params, "async-search submit")
+        context = data.get("context", {})
+        result_url = context.get("url")
+        if not result_url:
+            raise APIError(f"async-search returned no result URL: {json.dumps(data)[:200]}")
+        data["items"] = self._get_json(result_url, None, "async-search fetch").get("items", [])
+        return data
+
+    # ─── Suggest ──────────────────────────────────────────────────────────────
+
+    def suggest(self, query: str, limit: int = 10) -> Dict[str, Any]:
+        """
+        Autocomplete suggestions for a partial query.
+
+        Returns groups keyed 'name', 'kind', 'modified', 'category', 'history'
+        — useful for agents to discover exact filenames, file kinds, and
+        category values before running a full search.
+        """
+        return self._get_json(
+            "/qsirch/latest/api/suggest",
+            {"q": query, "limit": limit},
+            "suggest",
+        )
 
     # ─── Preview ──────────────────────────────────────────────────────────────
 
@@ -194,6 +292,9 @@ class QsirchClient:
         """
         Get preview for an item. For .eml files, returns full rendered HTML body.
         Uses the HATEOAS action URL from search results when available.
+
+        Preview by item ID alone is not supported by the server (returns 500);
+        path + name (or the item's own actions.preview URL) are required.
         """
         action_url = item.get("actions", {}).get("preview")
         if not action_url:
@@ -201,20 +302,34 @@ class QsirchClient:
             name = item.get("name", "")
             action_url = (
                 f"/qsirch/latest/api/qusion-item?"
-                f"action=preview&path={path}&name={name}&app_id=badguy"
+                f"action=preview&path={quote(path)}&name={quote(name)}&app_id=badguy"
             )
 
-        try:
-            resp = self._request("GET", action_url)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            print(f"[Error] Preview failed: {e}", file=sys.stderr)
-            return {}
+        return self._get_json(action_url, None, "preview")
+
+    # ─── Text detection (OCR blocks) ──────────────────────────────────────────
+
+    def text_detect(self, item: Dict[str, Any], lang: str = "ENG") -> Dict[str, Any]:
+        """
+        Server-side OCR text detection with bounding boxes.
+
+        Available for PDFs and images (the item's actions carry a 'text_detect'
+        URL); not available for .eml. Each block has 'text', 'vertices'
+        (four corner points) and 'score' (confidence 0-1).
+        """
+        action_url = item.get("actions", {}).get("text_detect")
+        if not action_url:
+            path = self._resolve_path(item)
+            name = item.get("name", "")
+            action_url = (
+                f"/qsirch/latest/api/preview/text-detection?"
+                f"path={quote(path)}&name={quote(name)}&lang={lang}&app_id=badguy"
+            )
+        return self._get_json(action_url, None, "text-detection")
 
     # ─── Download ─────────────────────────────────────────────────────────────
 
-    def download(self, item: Dict[str, Any], output_dir: str = ".") -> Optional[str]:
+    def download(self, item: Dict[str, Any], output_dir: str = ".", timeout: int = 120) -> Optional[str]:
         """
         Download a file from the NAS. Returns the local file path on success.
         Uses the HATEOAS action URL from search results when available.
@@ -225,56 +340,54 @@ class QsirchClient:
             name = item.get("name", "")
             action_url = (
                 f"/qsirch/latest/api/qusion-item?"
-                f"action=download&path={path}&name={name}&app_id=badguy"
+                f"action=download&path={quote(path)}&name={quote(name)}&app_id=badguy"
             )
 
-        try:
-            resp = self._request("GET", action_url, stream=True, timeout=60)
-            resp.raise_for_status()
+        url = f"{self.base_url}{action_url}" if action_url.startswith("/") else action_url
+        resp = self.session.get(url, stream=True, timeout=timeout)
+        if resp.status_code == 401 and self._do_login():
+            resp = self.session.get(url, stream=True, timeout=timeout)
+        if resp.status_code != 200:
+            raise APIError(f"download failed: HTTP {resp.status_code}: {resp.text[:200]}")
 
-            ext = item.get("extension", "")
-            filename = item.get("name", "download")
-            if ext and not filename.endswith(f".{ext}"):
-                filename = f"{filename}.{ext}"
+        ext = item.get("extension", "")
+        filename = item.get("name", "download")
+        if ext and not filename.endswith(f".{ext}"):
+            filename = f"{filename}.{ext}"
 
-            output_path = os.path.join(output_dir, filename)
-            with open(output_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        output_path = os.path.join(output_dir, filename)
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
 
-            return output_path
-
-        except Exception as e:
-            print(f"[Error] Download failed: {e}", file=sys.stderr)
-            return None
+        return output_path
 
     # ─── Status ───────────────────────────────────────────────────────────────
 
     def status(self) -> Dict[str, Any]:
         """Check Qsirch indexing status and health."""
-        try:
-            resp = self._request("GET", "/qsirch/latest/api/status")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            print(f"[Error] Status check failed: {e}", file=sys.stderr)
-            return {}
+        return self._get_json("/qsirch/latest/api/status", None, "status")
+
+    def status_brief(self) -> Dict[str, Any]:
+        """Lightweight status: license, health, index state."""
+        return self._get_json("/qsirch/latest/api/status/brief", None, "status/brief")
+
+    def about(self) -> Dict[str, Any]:
+        """Qsirch application version info."""
+        return self._get_json("/qsirch/latest/api/about", None, "about")
+
+    def system_settings(self) -> Dict[str, Any]:
+        """Feature flags: image OCR extraction, qumagie core, online viewer, ..."""
+        return self._get_json("/qsirch/latest/api/setting/system", None, "setting/system")
 
     # ─── More-Like-This ───────────────────────────────────────────────────────
 
     def similar(self, item_id: str, limit: int = 10, category: Optional[str] = None) -> Dict[str, Any]:
         """Find items similar to the given item ID (semantic/content similarity)."""
-        params = {"limit": limit}
+        params: Dict[str, Any] = {"limit": limit}
         if category:
             params["categories"] = category
-
-        try:
-            resp = self._request("GET", f"/qsirch/latest/api/more-like-this/{item_id}", params=params)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            print(f"[Error] Similar search failed: {e}", file=sys.stderr)
-            return {"total": 0, "items": []}
+        return self._get_json(f"/qsirch/latest/api/more-like-this/{item_id}", params, "more-like-this")
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -294,7 +407,7 @@ class QsirchClient:
 
     @staticmethod
     def extract_metadata(item: Dict[str, Any]) -> Dict[str, str]:
-        """Extract metadata key-values (from, to, subject, etc.) from an item."""
+        """Extract metadata key-values (from, to, subject, author, ...) from an item."""
         meta = {}
         for m in item.get("metadata", {}).get("all", []):
             key = m.get("key")
@@ -302,6 +415,59 @@ class QsirchClient:
             if key and val:
                 meta[key] = val
         return meta
+
+    @staticmethod
+    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Agent-friendly augmentation of a search item, computed client-side:
+
+        - full_path: the resolved absolute NAS path (item['path'] is only the
+          parent directory)
+        - modified_iso: normalized UTC-aware timestamp when parseable
+        - capabilities: which item actions are available (download, preview,
+          text_detect, mlt) so a caller knows what it can chain without
+          inspecting raw URLs
+        """
+        item = dict(item)
+        item["full_path"] = QsirchClient._resolve_path(item)
+
+        modified = item.get("modified")
+        parsed = parse_modified(modified)
+        if parsed:
+            item["modified_iso"] = parsed.isoformat()
+
+        actions = item.get("actions", {})
+        item["capabilities"] = sorted(k for k in ("download", "preview", "text_detect", "mlt", "thumbnail") if k in actions)
+        return item
+
+
+def parse_modified(value: Any) -> Optional[datetime]:
+    """
+    Normalize the 'modified' field into an aware datetime.
+
+    Observed formats (all verified against the live API):
+      - epoch seconds as int/numeric string ("1754460005")
+      - ISO-8601 with Z ("2026-08-06T06:00:05.739939Z")
+      - "YYYY/MM/DD HH:MM:SS" (preview.info entries)
+    Returns None when unparseable rather than guessing.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    try:
+        if text.replace(".", "", 1).isdigit():
+            return datetime.fromtimestamp(float(text), tz=timezone.utc)
+        if text.endswith("Z"):
+            return datetime.fromisoformat(text[:-1]).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(text)
+    except (ValueError, OSError):
+        pass
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 # ─── CLI Output Formatting ────────────────────────────────────────────────────
@@ -333,7 +499,7 @@ def format_item(item: Dict[str, Any], idx: int) -> str:
         lines.append(f"    Meta: {meta_str[:150]}")
 
     if content:
-        snippet = content.replace("\n", " ")[:200]
+        snippet = re.sub(r"</?qusion>", "", content).replace("\n", " ")[:200]
         lines.append(f"    Snippet: {snippet}")
 
     lines.append(f"    ID: {item.get('id', 'N/A')}")
@@ -353,43 +519,47 @@ def filter_items(
     Required because server-side GET filter parameters (ext, type, category)
     are silently ignored by Qsirch 7 — they have no effect on results.
     """
-    dt_from = datetime.strptime(date_from, "%Y-%m-%d") if date_from else None
-    dt_to = datetime.strptime(date_to, "%Y-%m-%d") if date_to else None
+    dt_from = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc) if date_from else None
+    # Inclusive end-of-day for the upper bound.
+    dt_to = datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc) if date_to else None
 
     filtered = []
     for item in items:
-        # Extension filter
         if ext:
             item_ext = str(item.get("extension", "")).lower()
             if item_ext != ext.lower().lstrip("."):
                 continue
 
-        # Path substring filter
         if path_filter:
             item_path = QsirchClient._resolve_path(item)
             if path_filter.lower() not in item_path.lower():
                 continue
 
-        # Date range filter on modified timestamp
         if dt_from or dt_to:
-            modified = item.get("modified", "")
-            if modified:
-                try:
-                    if str(modified).isdigit():
-                        item_dt = datetime.fromtimestamp(int(modified))
-                    else:
-                        item_dt = datetime.strptime(str(modified).split()[0], "%Y/%m/%d")
-
-                    if dt_from and item_dt < dt_from:
-                        continue
-                    if dt_to and item_dt > dt_to:
-                        continue
-                except (ValueError, OSError):
-                    pass
+            item_dt = parse_modified(item.get("modified"))
+            if item_dt is None:
+                # Unparseable timestamp: keep the item rather than silently
+                # dropping data the filter cannot judge.
+                filtered.append(item)
+                continue
+            if dt_from and item_dt < dt_from:
+                continue
+            if dt_to and item_dt > dt_to:
+                continue
 
         filtered.append(item)
 
     return filtered
+
+
+def html_to_text(html: str) -> str:
+    """Strip HTML to text for terminal display (scripts/styles removed first)."""
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", "\n", html)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
 
 
 # ─── Subcommand Handlers ──────────────────────────────────────────────────────
@@ -405,10 +575,12 @@ def cmd_search(args, client: QsirchClient):
         sort_dir=args.order,
         category=args.category,
         advanced_mode=args.mode,
+        highlight=args.highlight,
     )
 
     total = data.get("total", 0)
     items = data.get("items", [])
+    raw_count = len(items)
 
     # Apply client-side filters
     items = filter_items(
@@ -420,11 +592,18 @@ def cmd_search(args, client: QsirchClient):
     )
 
     if args.json:
-        output = {"total": total, "count": len(items), "offset": args.offset, "items": items}
+        output = {
+            "total": total,
+            "count": len(items),
+            "offset": args.offset,
+            "filtered_out": raw_count - len(items),
+            "items": [QsirchClient.enrich(i) for i in items],
+        }
         print(json.dumps(output, indent=2, default=str))
         return
 
-    print(f"Query: '{args.query}' | Total indexed matches: {total} | Showing: {len(items)}")
+    print(f"Query: '{args.query}' | Total indexed matches: {total} | Showing: {len(items)}"
+          + (f" (filtered {raw_count - len(items)} of {raw_count} client-side)" if raw_count != len(items) else ""))
     if args.category:
         print(f"Category filter: {args.category}")
     print("=" * 70)
@@ -434,10 +613,53 @@ def cmd_search(args, client: QsirchClient):
         print("-" * 70)
 
 
+def cmd_async_search(args, client: QsirchClient):
+    """Handle the 'async-search' subcommand."""
+    data = client.async_search(args.query, limit=args.limit, category=args.category)
+    items = data.get("items", [])
+
+    if args.json:
+        print(json.dumps(
+            {"total": data.get("total", 0), "count": len(items),
+             "items": [QsirchClient.enrich(i) for i in items]},
+            indent=2, default=str))
+        return
+
+    print(f"Query: '{args.query}' | Total indexed matches: {data.get('total', 0)} | Showing: {len(items)}")
+    print("=" * 70)
+    for idx, item in enumerate(items, 1):
+        print(format_item(item, idx))
+        print("-" * 70)
+
+
+def cmd_suggest(args, client: QsirchClient):
+    """Handle the 'suggest' subcommand."""
+    data = client.suggest(args.query, limit=args.limit)
+    groups = data.get("items", [])
+
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+        return
+
+    shown = False
+    for group in groups:
+        values = group.get("values", [])
+        if not values:
+            continue
+        shown = True
+        print(f"[{group.get('key', '?')}]")
+        for v in values:
+            print(f"  {v.get('display', v.get('key', ''))}")
+    if not shown:
+        print("No suggestions.")
+
+
 def cmd_preview(args, client: QsirchClient):
     """Handle the 'preview' subcommand."""
     if not (args.path and args.name):
         if args.id:
+            # NOTE: the server returns 500 for id-only preview (verified live);
+            # this path is kept for API versions that may support it.
             item = {
                 "actions": {
                     "preview": (
@@ -450,15 +672,14 @@ def cmd_preview(args, client: QsirchClient):
             print("[Error] Provide --path and --name, or --id", file=sys.stderr)
             sys.exit(1)
     else:
-        from urllib.parse import quote
-
         item = {
+            "name": args.name,
             "actions": {
                 "preview": (
                     f"/qsirch/latest/api/qusion-item?"
                     f"action=preview&path={quote(args.path)}&name={quote(args.name)}&app_id=badguy"
                 )
-            }
+            },
         }
 
     result = client.preview(item)
@@ -476,14 +697,44 @@ def cmd_preview(args, client: QsirchClient):
                     f.write(html)
                 print(f"Email HTML saved to: {args.output}")
             else:
-                import re
-
-                text = re.sub(r"<[^>]+>", "", html)
-                text = re.sub(r"\s+", " ", text).strip()
+                text = html_to_text(html)
                 print(f"Email body ({len(html)} chars HTML):")
                 print(text[:2000])
         else:
             print(json.dumps(result, indent=2, default=str))
+
+
+def cmd_detect(args, client: QsirchClient):
+    """Handle the 'detect' subcommand (OCR text blocks with coordinates)."""
+    if not (args.path and args.name):
+        print("[Error] --path and --name are required for detect", file=sys.stderr)
+        sys.exit(1)
+
+    item = {
+        "name": args.name,
+        "actions": {
+            "text_detect": (
+                f"/qsirch/latest/api/preview/text-detection?"
+                f"path={quote(args.path)}&name={quote(args.name)}&lang={args.lang}&app_id=badguy"
+            )
+        },
+    }
+    data = client.text_detect(item, lang=args.lang)
+    blocks = data.get("blocks", [])
+
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+        return
+
+    if args.text:
+        for b in blocks:
+            print(b.get("text", ""))
+        return
+
+    print(f"Detected {len(blocks)} text block(s):")
+    for i, b in enumerate(blocks, 1):
+        score = b.get("score", 0)
+        print(f"[{i}] ({score:.2f}) {b.get('text', '')}")
 
 
 def cmd_download(args, client: QsirchClient):
@@ -491,8 +742,6 @@ def cmd_download(args, client: QsirchClient):
     if not (args.path and args.name):
         print("[Error] --path and --name are required for download", file=sys.stderr)
         sys.exit(1)
-
-    from urllib.parse import quote
 
     item = {
         "name": args.name,
@@ -521,17 +770,33 @@ def cmd_status(args, client: QsirchClient):
     data = client.status()
 
     if args.json:
+        # Merge the cheap auxiliary endpoints for a fuller machine picture.
+        try:
+            data["brief"] = client.status_brief()
+        except QsirchError:
+            pass
+        try:
+            data["about"] = client.about()
+        except QsirchError:
+            pass
         print(json.dumps(data, indent=2, default=str))
-    else:
-        overview = data.get("overview", {})
-        indexed = overview.get("indexed", "?")
-        status = data.get("status", "unknown")
-        health = data.get("health", "?")
-        print(f"Qsirch Status: {status}")
-        print(f"Indexed files: {indexed:,}" if isinstance(indexed, int) else f"Indexed files: {indexed}")
-        print(f"Health: {health}")
-        if status == "indexing":
-            print("[Warning] Index is currently rebuilding — results may be incomplete.")
+        return
+
+    overview = data.get("overview", {})
+    indexed = overview.get("indexed", "?")
+    status = data.get("status", "unknown")
+    health = data.get("health", "?")
+    print(f"Qsirch Status: {status}")
+    print(f"Indexed files: {indexed:,}" if isinstance(indexed, int) else f"Indexed files: {indexed}")
+    print(f"Health: {health}")
+    try:
+        about = client.about().get("overview", {})
+        if about.get("version"):
+            print(f"Version: {about['version']}")
+    except QsirchError:
+        pass
+    if status == "indexing":
+        print("[Warning] Index is currently rebuilding — results may be incomplete.")
 
 
 def cmd_similar(args, client: QsirchClient):
@@ -567,6 +832,7 @@ def main():
             "  QSIRCH_USER  Username\n"
             "  QSIRCH_PASS  Password\n"
             "  QSIRCH_SSL   Set to '1' for HTTPS\n"
+            "\nExit codes: 0 success, 2 authentication failure, 3 API/transport failure.\n"
         ),
     )
 
@@ -576,6 +842,7 @@ def main():
     parser.add_argument("--user", default=os.environ.get("QSIRCH_USER"), help="Username")
     parser.add_argument("--pass", dest="password", default=os.environ.get("QSIRCH_PASS"), help="Password")
     parser.add_argument("--ssl", action="store_true", default=os.environ.get("QSIRCH_SSL", "0") == "1", help="HTTPS")
+    parser.add_argument("--timeout", type=int, default=15, help="Request timeout seconds (default: 15)")
 
     subparsers = parser.add_subparsers(dest="command", help="Command")
 
@@ -583,7 +850,7 @@ def main():
     sp_search = subparsers.add_parser("search", help="Full-text search")
     sp_search.add_argument(
         "--query", "-q", required=True,
-        help="Search query with optional syntax: \"exact phrase\", OR, AND, NOT, -exclude, (group)",
+        help="Search query with optional syntax: \"exact phrase\", OR, AND, NOT, -exclude, (group), '.' wildcard",
     )
     sp_search.add_argument(
         "--ext", help="Client-side extension filter (eml, pdf, doc, xlsx, csv)"
@@ -593,7 +860,7 @@ def main():
         choices=["Email", "PDF", "Documents", "Images", "Videos", "Music", "Excel", "Word"],
         help="Server-side category filter via POST (only 'Email' is strictly reliable)",
     )
-    sp_search.add_argument("--limit", type=int, default=50, help="Max results (default: 50)")
+    sp_search.add_argument("--limit", type=int, default=50, help=f"Max results (default: 50, ceiling: {MAX_RESULT_LIMIT})")
     sp_search.add_argument("--offset", type=int, default=0, help="Pagination offset")
     sp_search.add_argument(
         "--sort",
@@ -608,15 +875,37 @@ def main():
     sp_search.add_argument("--path", help="Client-side path substring filter")
     sp_search.add_argument("--from-date", help="Client-side date filter from (YYYY-MM-DD)")
     sp_search.add_argument("--to-date", help="Client-side date filter to (YYYY-MM-DD)")
-    sp_search.add_argument("--json", action="store_true", help="Output JSON")
+    sp_search.add_argument("--highlight", action="store_true", help="Wrap matches in <qusion> tags (500-char snippets)")
+    sp_search.add_argument("--json", action="store_true", help="Output JSON (items enriched with full_path, modified_iso, capabilities)")
+
+    # ─── async-search ─────────────────────────────────────────────────────────
+    sp_async = subparsers.add_parser("async-search", help="Two-phase search: fast total, then fetch result window")
+    sp_async.add_argument("--query", "-q", required=True, help="Search query")
+    sp_async.add_argument("--limit", type=int, default=50, help="Result window size (fixed at submit, ceiling 1000)")
+    sp_async.add_argument("--category", help="tools= filter (only 'Email' reliable)")
+    sp_async.add_argument("--json", action="store_true", help="Output JSON")
+
+    # ─── suggest ──────────────────────────────────────────────────────────────
+    sp_suggest = subparsers.add_parser("suggest", help="Autocomplete suggestions (name, kind, category, history)")
+    sp_suggest.add_argument("--query", "-q", required=True, help="Partial query to complete")
+    sp_suggest.add_argument("--limit", type=int, default=10, help="Suggestions per group (default: 10)")
+    sp_suggest.add_argument("--json", action="store_true", help="Output JSON")
 
     # ─── preview ──────────────────────────────────────────────────────────────
     sp_preview = subparsers.add_parser("preview", help="Get file preview / email HTML body")
-    sp_preview.add_argument("--id", help="Item ID from search results")
+    sp_preview.add_argument("--id", help="Item ID from search results (NOT supported server-side; use path+name)")
     sp_preview.add_argument("--path", help="File path on NAS")
     sp_preview.add_argument("--name", help="Filename (with extension)")
     sp_preview.add_argument("--output", "-o", help="Save output to file")
     sp_preview.add_argument("--json", action="store_true", help="Output JSON")
+
+    # ─── detect ───────────────────────────────────────────────────────────────
+    sp_detect = subparsers.add_parser("detect", help="OCR text detection with bounding boxes (PDF/images)")
+    sp_detect.add_argument("--path", required=True, help="File path on NAS")
+    sp_detect.add_argument("--name", required=True, help="Filename (with extension)")
+    sp_detect.add_argument("--lang", default="ENG", help="OCR language (default: ENG)")
+    sp_detect.add_argument("--text", action="store_true", help="Print detected text only, one block per line")
+    sp_detect.add_argument("--json", action="store_true", help="Output JSON (blocks with vertices and score)")
 
     # ─── download ─────────────────────────────────────────────────────────────
     sp_download = subparsers.add_parser("download", help="Download a file from NAS")
@@ -627,7 +916,7 @@ def main():
 
     # ─── status ───────────────────────────────────────────────────────────────
     sp_status = subparsers.add_parser("status", help="Check Qsirch index status & health")
-    sp_status.add_argument("--json", action="store_true", help="Output JSON")
+    sp_status.add_argument("--json", action="store_true", help="Output JSON (includes version + brief)")
 
     # ─── similar ──────────────────────────────────────────────────────────────
     sp_similar = subparsers.add_parser("similar", help="Find similar items (more-like-this)")
@@ -637,7 +926,7 @@ def main():
     sp_similar.add_argument("--json", action="store_true", help="Output JSON")
 
     # Backward compatibility: if no subcommand but -q is present, assume "search"
-    subcommands = {"search", "preview", "download", "status", "similar"}
+    subcommands = {"search", "async-search", "suggest", "preview", "detect", "download", "status", "similar"}
     if not any(arg in subcommands for arg in sys.argv[1:]):
         if "-q" in sys.argv or "--query" in sys.argv:
             sys.argv.insert(1, "search")
@@ -658,19 +947,23 @@ def main():
         sys.exit(1)
 
     # Connect
-    client = QsirchClient(host=args.host, port=args.port, use_ssl=args.ssl)
-    if not client.login(args.user, args.password):
-        sys.exit(1)
-
-    # Dispatch
-    handlers = {
-        "search": cmd_search,
-        "preview": cmd_preview,
-        "download": cmd_download,
-        "status": cmd_status,
-        "similar": cmd_similar,
-    }
-    handlers[args.command](args, client)
+    client = QsirchClient(host=args.host, port=args.port, use_ssl=args.ssl, timeout=args.timeout)
+    try:
+        client.login(args.user, args.password)
+        handlers = {
+            "search": cmd_search,
+            "async-search": cmd_async_search,
+            "suggest": cmd_suggest,
+            "preview": cmd_preview,
+            "detect": cmd_detect,
+            "download": cmd_download,
+            "status": cmd_status,
+            "similar": cmd_similar,
+        }
+        handlers[args.command](args, client)
+    except QsirchError as e:
+        print(f"[Error] {e}", file=sys.stderr)
+        sys.exit(e.exit_code)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@ name: qsirch
 description: >
   QNAP Qsirch 7 REST API client for searching emails (.eml), documents (.pdf, .doc, .xlsx),
   and files on a QNAP NAS. Supports full-text search, server-side category filtering,
-  email HTML preview extraction, file download, pagination, and semantic similar-item search.
+  autocomplete suggestions, two-phase async search, email HTML preview extraction, OCR text
+  detection with bounding boxes, file download, pagination, and semantic similar-item search.
 ---
 
 # Qsirch — QNAP NAS Email & File Search
@@ -25,6 +26,8 @@ Search indexed emails and documents on a QNAP NAS via the Qsirch 7 REST API.
    pip install requests
    ```
 
+Exit codes: `0` success, `2` authentication failure, `3` API/transport failure.
+
 ## Commands
 
 ### Search
@@ -34,50 +37,63 @@ python qsirch.py search -q "<KEYWORDS>" [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-q` / `--query` | *(required)* | Search query with syntax: `"exact phrase"`, `OR`, `AND`, `NOT`, `-exclude`, `(group)`. Use `.` for wildcard. |
+| `-q` / `--query` | *(required)* | Search query with syntax: `"exact phrase"`, `OR`, `AND`, `NOT`, `-exclude`, `(group)`. Use `.` for wildcard (`*` returns 0). |
 | `--category` | | Server-side filter via POST: `Email` (only strictly reliable). Others return mixed results. |
 | `--ext` | | Client-side extension filter: `eml`, `pdf`, `doc`, `xlsx`, `csv` |
-| `--limit` | `50` | Max results |
-| `--offset` | `0` | Pagination offset |
-| `--sort` | | `relevance`, `modified`, `created`, `size`, `name` |
-| `--order` | `desc` | `asc` / `desc` (default is ascending server-side; ignored for relevance) |
-| `--mode` | `0` | `0`=text, `1`=image OCR, `2`=combined |
 | `--path` | | Client-side path substring filter |
-| `--from-date` | | Date from (`YYYY-MM-DD`) |
-| `--to-date` | | Date to (`YYYY-MM-DD`) |
-| `--json` | | Raw JSON output |
+| `--from-date` / `--to-date` | | Client-side `YYYY-MM-DD` bounds on modified date (inclusive) |
+| `--limit` | `50` | Max results; server ceiling is **1000** (clamped with a warning) |
+| `--offset` | `0` | Pagination offset |
+| `--sort` | | `relevance`, `modified`, `created`, `size`, `name` (NOT `title` — broken) |
+| `--order` | `desc` | `asc` / `desc` (server default is ascending) |
+| `--mode` | `0` | `0`=text, `1`=image OCR, `2`=combined |
+| `--highlight` | off | Wrap matches in `<qusion>` tags (500-char snippets; longer returns empty) |
+| `--json` | off | JSON output; items enriched with `full_path`, `modified_iso`, `capabilities` |
 
-### Preview (Email HTML Extraction)
+### Suggest (autocomplete)
 ```bash
-python qsirch.py preview --path "<path>" --name "<filename>" [--output file.html] [--json]
+python qsirch.py suggest -q "inv" [--limit 10] [--json]
 ```
+Returns suggestion groups (`name`, `kind`, `modified`, `category`, `history`) for discovering exact values before a full search.
+
+### Async search (two-phase)
+```bash
+python qsirch.py async-search -q "<KEYWORDS>" [--limit 100] [--json]
+```
+Fast total count + result fetch. Window size is fixed at submit; `limit`/`offset` on the fetch are ignored server-side.
+
+### Preview
+```bash
+python qsirch.py preview --path "<dir>" --name "<file>" [--output out.html] [--json]
+```
+`.eml` → `container_type: "html-eml"` with the full HTML body in `html`. Preview by item ID alone returns HTTP 500; always use path+name.
+
+### Detect (OCR text blocks)
+```bash
+python qsirch.py detect --path "<dir>" --name "<file>" [--lang ENG] [--text] [--json]
+```
+Server-side OCR for PDFs/images (not `.eml`). Blocks carry `text`, `vertices` (bounding box), and `score` (confidence).
 
 ### Download
 ```bash
-python qsirch.py download --path "<path>" --name "<filename>" [--ext pdf] [-o ./dir/]
+python qsirch.py download --path "<dir>" --name "<file>" [--ext pdf] [--output ./dir]
 ```
 
 ### Status
 ```bash
 python qsirch.py status [--json]
 ```
+Index state, indexed file count, health, and app version. If `indexing`, results may be temporarily incomplete.
 
-### Similar (More-Like-This)
+### Similar (more-like-this)
 ```bash
-python qsirch.py similar --id <item_id> [--limit 10] [--category Email] [--json]
+python qsirch.py similar --id "<item-id>" [--limit 10] [--category Email] [--json]
 ```
 
-## Key API Notes
+## Agent Workflow Notes
 
-- **Advanced query syntax works in `q=`**: `"exact phrase"`, `OR`, `AND`, `NOT`, `-exclude`, `(grouping)` are all processed server-side.
-- `q.*` params (`q.category`, `q.modified`, `q.path`, `q.name`, `q.string`) in the web UI URL are **client-side UI state** — the API ignores them.
-- Extension/type GET params are **silently ignored** — filtering is done client-side.
-- POST `tools=Email` is the only strictly reliable category filter. Other values return mixed types — combine with `--ext`.
-- Sort param is `sort_by` (not `sort`). Direction is `sort_dir` (not `order`). Default direction is ascending. Ignored for `relevance`.
-- `sort_by=title` is broken (returns 0 results) — use `name`.
-- Wildcard is `.` or space — `*` returns 0 results.
-- `advanced_mode`: `0`=text, `1`=image OCR, `2`=combined.
-- `highlight=content` wraps matches in `<qusion>` tags; `highlight_limit` controls snippet length.
-- `item["path"]` is parent dir only — full path is in `item["preview"]["info"][key=="path"]`.
-- Session auto-recovers on HTTP 401 / error code 101.
-- API aliases: `/v1/`, `/v2/`, `/stable/`, `/latest/` all resolve identically.
+- Use `--json` everywhere for programmatic consumption; enriched items expose `capabilities` so you know which chained actions (`download`, `preview`, `text_detect`, `mlt`) exist per item.
+- Chain: `search` → pick item by `full_path` → `preview` (emails) or `detect` (scanned PDFs/images) or `download`.
+- Extension/date filtering is client-side (server ignores GET filter params) — the CLI applies it; note `count` vs `total` in JSON output (`filtered_out` reports the delta).
+- Snippets are 500 chars; use `detect --text` for full OCR text of image-like documents.
+- Result pages are capped at 1000 items; paginate with `--offset`.
